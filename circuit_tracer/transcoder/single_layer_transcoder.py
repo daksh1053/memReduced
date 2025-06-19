@@ -1,7 +1,7 @@
 import os
 from collections import namedtuple
 from importlib import resources
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 
 import numpy as np
 import torch
@@ -14,6 +14,46 @@ from torch import nn
 import circuit_tracer
 from circuit_tracer.transcoder.activation_functions import JumpReLU
 from circuit_tracer.utils.hf_utils import download_hf_uris, parse_hf_uri
+
+
+class TranscoderCollection:
+    """
+    A collection of transcoders that handles lazy loading to a device.
+    Only one transcoder is on the device at any given time.
+    """
+
+    def __init__(self, transcoders: Dict[int, "SingleLayerTranscoder"], device, dtype):
+        self.transcoders = {
+            layer: transcoder.to("cpu") for layer, transcoder in transcoders.items()
+        }
+        self.device = device
+        self.dtype = dtype
+        self.active_layer = None
+
+    def __getitem__(self, layer: int) -> "SingleLayerTranscoder":
+        if self.active_layer is not None and self.active_layer != layer:
+            self.transcoders[self.active_layer].to("cpu")
+
+        transcoder = self.transcoders[layer]
+        print(f"transcoder: {layer}")
+        transcoder.to(device=self.device, dtype=self.dtype)
+        self.active_layer = layer
+        return transcoder
+
+    def __len__(self) -> int:
+        return len(self.transcoders)
+
+    def values(self):
+        return self.transcoders.values()
+
+    def keys(self):
+        return self.transcoders.keys()
+
+    def items(self):
+        return self.transcoders.items()
+
+    def __iter__(self):
+        return iter(self.transcoders.values())
 
 
 class SingleLayerTranscoder(nn.Module):
@@ -82,6 +122,8 @@ class SingleLayerTranscoder(nn.Module):
 
     def compute_skip(self, input_acts):
         if self.W_skip is not None:
+            # Convert input_acts to the same dtype as W_skip
+            input_acts = input_acts.to(dtype=self.W_skip.dtype, device=self.W_skip.device)
             return input_acts @ self.W_skip.T
         else:
             raise ValueError("Transcoder has no skip connection")
@@ -184,6 +226,10 @@ def load_transcoder_set(
     """
 
     scan = None
+    # print(f"scan: {scan}")
+    # scan = "qwen3-4B"
+    # print(f"scann: {scan}")
+
     # try to match a preset, and grab its config
     if transcoder_config_file == "gemma":
         package_path = resources.files(circuit_tracer)
@@ -194,6 +240,7 @@ def load_transcoder_set(
         transcoder_config_file = package_path / "configs/llama-relu.yaml"
         scan = "llama-3-131k-relu"
 
+
     with open(transcoder_config_file, "r") as file:
         config = yaml.safe_load(file)
 
@@ -201,10 +248,12 @@ def load_transcoder_set(
     if scan is None:
         # the scan defaults to a list of transcoder ids, preceded by the model's name
         model_name_no_slash = config["model_name"].split("/")[-1]
+
         scan = [
             f"{model_name_no_slash}/{transcoder_config['id']}"
             for transcoder_config in sorted_transcoder_configs
         ]
+
 
     hf_paths = [
         t["filepath"] for t in sorted_transcoder_configs if t["filepath"].startswith("hf://")
@@ -219,15 +268,21 @@ def load_transcoder_set(
             repo_id = parse_hf_uri(path).repo_id
             if "gemma-scope" in repo_id:
                 transcoder = load_gemma_scope_transcoder(
-                    local_path, transcoder_config["layer"], device=device, dtype=dtype
+                    local_path,
+                    transcoder_config["layer"],
+                    device=torch.device("cpu"),
+                    dtype=dtype,
                 )
             else:
                 transcoder = load_relu_transcoder(
-                    local_path, transcoder_config["layer"], device=device, dtype=dtype
+                    local_path,
+                    transcoder_config["layer"],
+                    device=torch.device("cpu"),
+                    dtype=dtype,
                 )
         else:
             transcoder = load_relu_transcoder(
-                path, transcoder_config["layer"], device=device, dtype=dtype
+                path, transcoder_config["layer"], device=torch.device("cpu"), dtype=dtype
             )
         assert transcoder.layer_idx not in transcoders, (
             f"Got multiple transcoders for layer {transcoder.layer_idx}"
@@ -241,4 +296,5 @@ def load_transcoder_set(
     )
     feature_input_hook = config["feature_input_hook"]
     feature_output_hook = config["feature_output_hook"]
-    return TranscoderSettings(transcoders, feature_input_hook, feature_output_hook, scan)
+    collection = TranscoderCollection(transcoders, device=device, dtype=dtype)
+    return TranscoderSettings(collection, feature_input_hook, feature_output_hook, scan)

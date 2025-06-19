@@ -8,7 +8,11 @@ from torch import nn
 from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformer_lens.hook_points import HookPoint
 
-from circuit_tracer.transcoder import SingleLayerTranscoder, load_transcoder_set
+from circuit_tracer.transcoder import (
+    SingleLayerTranscoder,
+    TranscoderCollection,
+    load_transcoder_set,
+)
 
 
 class ReplacementMLP(nn.Module):
@@ -51,7 +55,7 @@ class ReplacementUnembed(nn.Module):
 
 class ReplacementModel(HookedTransformer):
     d_transcoder: int
-    transcoders: nn.ModuleList
+    transcoders: "TranscoderCollection"
     feature_input_hook: str
     feature_output_hook: str
     skip_transcoder: bool
@@ -61,7 +65,7 @@ class ReplacementModel(HookedTransformer):
     def from_config(
         cls,
         config: HookedTransformerConfig,
-        transcoders: Dict[int, SingleLayerTranscoder],
+        transcoders: "TranscoderCollection",
         feature_input_hook: str = "mlp.hook_in",
         feature_output_hook: str = "mlp.hook_out",
         scan: Optional[str] = None,
@@ -89,7 +93,7 @@ class ReplacementModel(HookedTransformer):
     def from_pretrained_and_transcoders(
         cls,
         model_name: str,
-        transcoders: Dict[int, SingleLayerTranscoder],
+        transcoders: "TranscoderCollection",
         feature_input_hook: str = "mlp.hook_in",
         feature_output_hook: str = "mlp.hook_out",
         scan: str = None,
@@ -147,6 +151,8 @@ class ReplacementModel(HookedTransformer):
             transcoder_set, device=device, dtype=dtype
         )
 
+        
+
         return cls.from_pretrained_and_transcoders(
             model_name,
             transcoders,
@@ -160,23 +166,19 @@ class ReplacementModel(HookedTransformer):
 
     def _configure_replacement_model(
         self,
-        transcoders: Dict[int, SingleLayerTranscoder],
+        transcoders: "TranscoderCollection",
         feature_input_hook: str,
         feature_output_hook: str,
         scan: Optional[Union[str, List[str]]],
     ):
-        for transcoder in transcoders.values():
-            transcoder.to(self.cfg.device, self.cfg.dtype)
-
-        self.add_module(
-            "transcoders",
-            nn.ModuleList([transcoders[i] for i in range(self.cfg.n_layers)]),
-        )
-        self.d_transcoder = transcoder.d_transcoder
+        self.transcoders = transcoders
+        # Get a sample transcoder for metadata. It will be on CPU, which is fine.
+        sample_transcoder = next(iter(transcoders.values()))
+        self.d_transcoder = sample_transcoder.d_transcoder
         self.feature_input_hook = feature_input_hook
         self.original_feature_output_hook = feature_output_hook
         self.feature_output_hook = feature_output_hook + ".hook_out_grad"
-        self.skip_transcoder = transcoder.W_skip is not None
+        self.skip_transcoder = sample_transcoder.W_skip is not None
         self.scan = scan
 
         for block in self.blocks:
@@ -189,8 +191,8 @@ class ReplacementModel(HookedTransformer):
         self.setup()
 
     def _configure_gradient_flow(self):
-        for layer, transcoder in enumerate(self.transcoders):
-            self._configure_skip_connection(self.blocks[layer], transcoder)
+        for layer in range(len(self.transcoders)):
+            self._configure_skip_connection(self.blocks[layer], layer)
 
         def stop_gradient(acts, hook):
             return acts.detach()
@@ -214,7 +216,7 @@ class ReplacementModel(HookedTransformer):
 
         self.hook_embed.add_hook(enable_gradient, is_permanent=True)
 
-    def _configure_skip_connection(self, block, transcoder):
+    def _configure_skip_connection(self, block, layer):
         cached = {}
 
         def cache_activations(acts, hook):
@@ -225,6 +227,7 @@ class ReplacementModel(HookedTransformer):
             # of this function. If we put the backwards hook here at hook, the grads will be 0
             # because we detached acts.
             skip_input_activation = cached.pop("acts")
+            transcoder = self.transcoders[layer]
             if transcoder.W_skip is not None:
                 skip = transcoder.compute_skip(skip_input_activation)
             else:
