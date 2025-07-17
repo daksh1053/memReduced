@@ -192,13 +192,19 @@ def load_relu_transcoder(
 
     assert param_dict.get("log_thresholds") is None
     activation_function = F.relu
+    # with open("param_dict_14.txt", "a") as f:
+    #     for key,value in param_dict.items():
+    #         f.write(f"{key}\n")
+    #         f.write(f"{value.shape}\n")
+    #     f.write("\n\n\n")
+
     with torch.device("meta"):
         transcoder = SingleLayerTranscoder(
             d_model,
             d_sae,
             activation_function,
             layer,
-            skip_connection=param_dict["W_skip"] is not None,
+            skip_connection=param_dict.get("W_skip") is not None,
         )
     transcoder.load_state_dict(param_dict, assign=True)
     return transcoder.to(dtype)
