@@ -1,0 +1,19 @@
+keep model and transcoder over runs
+move model back from gpu to create a save package
+
+
+
+reduce features for token, layer where they are in thousands
+
+
+feature visualization - hopefully dint have to do
+
+    epsilon = 1e-9  # Define your threshold for "very close to zero"
+    indices = activation_matrix.indices()
+    values = activation_matrix.values()
+    
+    mask = torch.abs(values) > epsilon
+    
+    activation_matrix = torch.sparse_coo_tensor(
+        indices[:, mask], values[mask], activation_matrix.shape
+    )
