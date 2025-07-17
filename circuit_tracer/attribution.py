@@ -38,25 +38,6 @@ from circuit_tracer.replacement_model import ReplacementModel
 from circuit_tracer.utils.disk_offload import offload_modules
 
 
-def gpu_mem_usage():
-    """Log GPU 1 memory usage for debugging."""
-    logger = logging.getLogger("attribution")
-    
-    if torch.cuda.is_available():
-        gpu_id = 0
-    
-    try:
-        memory_allocated = torch.cuda.memory_allocated(gpu_id) / 1024**3  # GB
-        memory_reserved = torch.cuda.memory_reserved(gpu_id) / 1024**3   # GB
-        max_memory = torch.cuda.max_memory_allocated(gpu_id) / 1024**3   # GB
-        
-        logger.info(
-            f"GPU{gpu_id} Memory - Allocated: {memory_allocated:.2f}GB, "
-            f"Reserved: {memory_reserved:.2f}GB, Max: {max_memory:.2f}GB"
-        )
-    except Exception as e:
-        logger.info(f"Error getting GPU{gpu_id} memory info: {e}")
-
 class AttributionContext:
     """Manage hooks for computing attribution rows.
 
@@ -136,49 +117,11 @@ class AttributionContext:
         proxy = weakref.proxy(self)
 
         def _hook_fn(grads: torch.Tensor, hook: HookPoint) -> None:
-            # output_vecs may be on CPU, so move to GPU for matmul
-            output_vecs_device = output_vecs.to(grads.device)
-
-            # The original einsum is memory-inefficient for feature hooks because
-            # grads[read_index] creates a massive intermediate tensor when
-            # read_index is a form of advanced indexing.
-            # We now handle the simple case (error/token nodes) and the complex
-            # case (feature nodes) separately.
-
-            # Simple case for error/token nodes where read_index is a simple slice
-            if isinstance(read_index, slice):
-                proxy._batch_buffer[write_index] = einsum(
-                    grads.to(output_vecs_device.dtype)[read_index],
-                    output_vecs_device,
-                    "batch position d_model, position d_model -> position batch",
-                )
-                return
-
-            # Advanced case for feature nodes. We loop over positions to avoid OOM.
-            if not isinstance(read_index, tuple) or len(read_index) != 2:
-                raise TypeError(f"Unexpected read_index type for feature hook: {type(read_index)}")
-
-            positions_for_activations = read_index[1]
-            n_pos = grads.shape[1]
-            result_buffer = torch.zeros_like(proxy._batch_buffer[write_index])
-
-            for pos_idx in range(n_pos):
-                activations_at_pos_mask = positions_for_activations == pos_idx
-                if not torch.any(activations_at_pos_mask):
-                    continue
-
-                output_vecs_at_pos = output_vecs_device[activations_at_pos_mask]
-                grads_at_pos = grads[:, pos_idx, :]  # Shape: (batch, d_model)
-
-                # einsum("batch d_model, n_activations d_model -> n_activations batch")
-                einsum_result = einsum(
-                    grads_at_pos.to(output_vecs_device.dtype),
-                    output_vecs_at_pos,
-                    "b d, p d -> p b",
-                )
-                result_buffer[activations_at_pos_mask] = einsum_result
-
-            proxy._batch_buffer[write_index] = result_buffer
+            proxy._batch_buffer[write_index] = einsum(
+                grads.to(output_vecs.dtype)[read_index],
+                output_vecs,
+                "batch position d_model, position d_model -> position batch",
+            )
 
         return hook_name, _hook_fn
 
@@ -346,9 +289,6 @@ def compute_salient_logits(
     return top_idx, top_p, demeaned.T
 
 
-
-
-
 @torch.no_grad()
 def select_scaled_decoder_vecs(
     activations: torch.sparse.Tensor, transcoders: Sequence
@@ -357,128 +297,30 @@ def select_scaled_decoder_vecs(
 
     The return value is already scaled by the feature activation, making it
     suitable as ``inject_values`` during gradient overrides.
-    This function allocates the final tensor on the CPU to avoid GPU OOM errors
-    when the number of active features is very large.
     """
-    logger = logging.getLogger("attribution")
 
-    total_activations = activations._nnz()
-    if total_activations == 0:
-        return torch.empty(
-            0,
-            transcoders[0].W_dec.shape[1],
-            dtype=transcoders[0].W_dec.dtype,
-            device="cpu",
-        )
-
-    d_model = transcoders[0].W_dec.shape[1]
-    dtype = transcoders[0].W_dec.dtype
-
-    logger.info("Allocating decoder vectors on CPU to save GPU memory.")
-    # Allocate final tensor on CPU to avoid GPU OOM.
-    final_tensor = torch.empty(total_activations, d_model, dtype=dtype, device="cpu")
-
-    current_offset = 0
+    rows: List[torch.Tensor] = []
     for layer, row in enumerate(activations):
-        gpu_mem_usage()
-        logger.info(f"Processing layer {layer} for decoder vectors.")
         _, feat_idx = row.coalesce().indices()
-        num_activations_in_layer = len(feat_idx)
-
-        if num_activations_in_layer == 0:
-            continue
-
-        # Fetch decoder rows for the current layer on GPU
-        decoder_rows = transcoders[layer].W_dec[feat_idx]
-
-        # Copy the rows to the final CPU tensor
-        final_tensor[
-            current_offset : current_offset + num_activations_in_layer
-        ] = decoder_rows.cpu()
-
-        current_offset += num_activations_in_layer
-
-        # Free GPU memory explicitly
-        del decoder_rows
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    logger.info("Finished gathering all decoder vectors on CPU.")
-
-    # The activation values are on the GPU, so move them to the CPU for the multiplication
-    activation_vals_cpu = activations.values().cpu()
-    final_tensor *= activation_vals_cpu[:, None]
-
-    logging.getLogger("attribution").info(
-        f"Final scaled decoder vectors created on CPU with shape: {final_tensor.shape}"
-    )
-    gpu_mem_usage()
-    return final_tensor
+        rows.append(transcoders[layer].W_dec[feat_idx])
+    return torch.cat(rows) * activations.values()[:, None]
 
 
 @torch.no_grad()
 def select_encoder_rows(
     activation_matrix: torch.sparse.Tensor, transcoders: Sequence
 ) -> torch.Tensor:
-    """Return encoder rows for **active** features only.
+    """Return encoder rows for **active** features only."""
 
-    This function allocates the final tensor on the CPU to avoid GPU OOM errors
-    when the number of active features is very large.
-    """
-    logger = logging.getLogger("attribution")
-
-    total_activations = activation_matrix._nnz()
-    if total_activations == 0:
-        return torch.empty(
-            0,
-            transcoders[0].W_enc.shape[0],  # d_model
-            dtype=transcoders[0].W_enc.dtype,
-            device="cpu",
-        )
-
-    d_model = transcoders[0].W_enc.shape[0]
-    dtype = transcoders[0].W_enc.dtype
-
-    logger.info("Allocating encoder rows on CPU to save GPU memory.")
-    # Allocate final tensor on CPU to avoid GPU OOM.
-    final_tensor = torch.empty(total_activations, d_model, dtype=dtype, device="cpu")
-
-    current_offset = 0
+    rows: List[torch.Tensor] = []
     for layer, row in enumerate(activation_matrix):
-        logger.info(f"Processing layer {layer} for encoder rows.")
         _, feat_idx = row.coalesce().indices()
-        num_activations_in_layer = len(feat_idx)
-
-        if num_activations_in_layer == 0:
-            continue
-
-        # Fetch encoder rows for the current layer on GPU
-        encoder_rows_gpu = transcoders[layer].W_enc.T[feat_idx]
-
-        # Copy the rows to the final CPU tensor
-        final_tensor[
-            current_offset : current_offset + num_activations_in_layer
-        ] = encoder_rows_gpu.cpu()
-
-        current_offset += num_activations_in_layer
-
-        # Free GPU memory explicitly
-        del encoder_rows_gpu
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    logger.info("Finished gathering all encoder rows on CPU.")
-    logging.getLogger("attribution").info(
-        f"Final encoder rows tensor created on CPU with shape: {final_tensor.shape}"
-    )
-    return final_tensor
+        rows.append(transcoders[layer].W_enc.T[feat_idx])
+    return torch.cat(rows)
 
 
 def compute_partial_influences(edge_matrix, logit_p, row_to_node_index, max_iter=128, device=None):
-    # This computation can be very memory-intensive with large edge matrices.
-    # We force it to the CPU to prevent CUDA OOM errors, as the influence
-    # calculation is intermediate and doesn't need to be on the GPU.
-    # device = torch.device("cpu")
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     normalized_matrix = torch.empty_like(edge_matrix, device=device).copy_(edge_matrix)
     normalized_matrix = normalized_matrix.abs_()
@@ -575,77 +417,6 @@ def attribute(
 
         logger.removeHandler(handler)
 
-def generate_all_plots(activation_matrix, output_dir="all_plots_14"):
-    """
-    Generates a plot for each layer and token, saving them to a single directory.
-    """
-    import matplotlib.pyplot as plt
-    import os
-
-    os.makedirs(output_dir, exist_ok=True)
-    n_layers, n_pos, _ = activation_matrix.shape
-    dense_activations = activation_matrix.cpu().to_dense()
-
-    for layer_idx in range(n_layers):
-        for pos_idx in range(n_pos):
-            values_for_slice = dense_activations[layer_idx, pos_idx, :]
-            sorted_activations, _ = torch.sort(values_for_slice, descending=True)
-
-            if sorted_activations.numel() == 0:
-                continue
-
-            plt.figure(figsize=(10, 6))
-            plt.plot(sorted_activations.float().numpy())
-            plt.yscale('symlog', linthresh=1e-5)
-            plt.title(f'Layer {layer_idx}, Token {pos_idx} - Sorted Activations (symlog scale)')
-            plt.xlabel('Feature Rank (sorted)')
-            plt.ylabel('Activation Value (symlog scale)')
-            plt.grid(True)
-
-            save_path = os.path.join(output_dir, f"layer_{layer_idx}_token_{pos_idx}.png")
-            plt.savefig(save_path)
-            plt.close()
-    
-    return output_dir
-
-def create_grouped_zips(plots_dir="all_plots_14"):
-    """
-    Groups plots from a directory into two zip files (one by layer, one by token),
-    with plots organized into subdirectories within each zip.
-    """
-    import os
-    import re
-    import zipfile
-    from collections import defaultdict
-
-    layer_files = defaultdict(list)
-    token_files = defaultdict(list)
-    
-    file_pattern = re.compile(r"layer_(\d+)_token_(\d+)\.png")
-
-    for filename in os.listdir(plots_dir):
-        match = file_pattern.match(filename)
-        if match:
-            layer_idx = int(match.group(1))
-            token_idx = int(match.group(2))
-            filepath = os.path.join(plots_dir, filename)
-            layer_files[layer_idx].append(filepath)
-            token_files[token_idx].append(filepath)
-
-    # Create one zip file grouped by layer
-    with zipfile.ZipFile("visualizations_by_layer_14.zip", 'w') as zipf:
-        for layer_idx, files in layer_files.items():
-            for file in files:
-                arcname = os.path.join(f"layer_{layer_idx}", os.path.basename(file))
-                zipf.write(file, arcname)
-    
-    # Create one zip file grouped by token
-    with zipfile.ZipFile("visualizations_by_token_14.zip", 'w') as zipf:
-        for token_idx, files in token_files.items():
-            for file in files:
-                arcname = os.path.join(f"token_{token_idx}", os.path.basename(file))
-                zipf.write(file, arcname)
-
 
 def _run_attribution(
     model,
@@ -665,33 +436,14 @@ def _run_attribution(
     logger.info("Phase 0: Precomputing activations and vectors")
     phase_start = time.time()
     input_ids = ensure_tokenized(prompt, model.tokenizer)
-    print("a")
     logits, activation_matrix, error_vecs, token_vecs = model.setup_attribution(
         input_ids, sparse=True
     )
-    
-    # Prune near-zero activations from the sparse matrix
-    # epsilon = 1e-9  # Define your threshold for "very close to zero"
-    # indices = activation_matrix.indices()
-    # values = activation_matrix.values()
-    
-    # mask = torch.abs(values) > epsilon
-    
-    # activation_matrix = torch.sparse_coo_tensor(
-    #     indices[:, mask], values[mask], activation_matrix.shape
-    # )
-
-    # plots_dir = generate_all_plots(activation_matrix)
-    # create_grouped_zips(plots_dir)
-
     decoder_vecs = select_scaled_decoder_vecs(activation_matrix, model.transcoders)
-    print("c")
     encoder_rows = select_encoder_rows(activation_matrix, model.transcoders)
-    print("d")
     ctx = AttributionContext(
         activation_matrix, error_vecs, token_vecs, decoder_vecs, model.feature_output_hook
     )
-    print("e")
     logger.info(f"Precomputation completed in {time.time() - phase_start:.2f}s")
     logger.info(f"Found {activation_matrix._nnz()} active features")
 
@@ -767,7 +519,6 @@ def _run_attribution(
 
     pbar = tqdm(total=max_feature_nodes, desc="Feature influence computation", disable=not verbose)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     while n_visited < max_feature_nodes:
         if max_feature_nodes == total_active_feats:
             pending = torch.arange(total_active_feats)
@@ -783,16 +534,14 @@ def _run_attribution(
 
         for idx_batch in queue:
             n_visited += len(idx_batch)
-            print("attr")
-            gpu_mem_usage()
-            inject_values = encoder_rows[idx_batch].to(device)
+
             rows = ctx.compute_batch(
                 layers=feat_layers[idx_batch],
                 positions=feat_pos[idx_batch],
-                inject_values=inject_values,
+                inject_values=encoder_rows[idx_batch],
                 retain_graph=n_visited < max_feature_nodes,
             )
-            gpu_mem_usage()
+
             end = min(st + batch_size, st + rows.shape[0])
             edge_matrix[st:end, :logit_offset] = rows.cpu()
             row_to_node_index[st:end] = idx_batch
